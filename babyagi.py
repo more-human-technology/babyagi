@@ -22,6 +22,16 @@ from chromadb.config import Settings
 
 client = chromadb.Client(Settings(anonymized_telemetry=False))
 
+# Import loaders/splitters/embeddings modules
+from langchain.embeddings.sentence_transformer import SentenceTransformerEmbeddings
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.document_loaders import TextLoader
+
+import requests
+bubble_endpoint_url = "https://events.more-human.co.uk/version-8bws/api/1.1/wf/babyagi-test/"
+#bubble_endpoint_wf_1 = "babyagitest"
+
 # Engine configuration
 
 # Model: GPT, LLAMA, HUMAN, etc.
@@ -192,9 +202,8 @@ class DefaultResultsStorage:
         logging.getLogger('chromadb').setLevel(logging.ERROR)
         # Create Chroma collection
         chroma_persist_dir = "chroma"
-        chroma_client = chromadb.Client(
+        chroma_client = chromadb.PersistentClient(
             settings=chromadb.config.Settings(
-                chroma_db_impl="duckdb+parquet",
                 persist_directory=chroma_persist_dir,
             )
         )
@@ -365,6 +374,15 @@ def openai_call(
                     frequency_penalty=0,
                     presence_penalty=0,
                 )
+
+                tokens_used = response.usage.total_tokens
+                # Read current token count from file
+                current_token_count = read_token_count_from_file(model=model.lower())
+                # Update the token count
+                new_token_count = current_token_count + tokens_used
+                # Write the new token count back to the file
+                write_token_count_to_file(model=model.lower(), count=new_token_count)
+
                 return response.choices[0].text.strip()
             else:
                 # Use 4000 instead of the real limit (4097) to give a bit of wiggle room for the encoding of roles.
@@ -382,6 +400,15 @@ def openai_call(
                     n=1,
                     stop=None,
                 )
+
+                tokens_used = response.usage.total_tokens
+                # Read current token count from file
+                current_token_count = read_token_count_from_file(model=model.lower())
+                # Update the token count
+                new_token_count = current_token_count + tokens_used
+                # Write the new token count back to the file
+                write_token_count_to_file(model=model.lower(), count=new_token_count)
+
                 return response.choices[0].message.content.strip()
         except openai.error.RateLimitError:
             print(
@@ -507,15 +534,27 @@ def execution_agent(objective: str, task: str) -> str:
 
     """
 
-    context = context_agent(query=objective, top_results_num=5)
-    # print("\n****RELEVANT CONTEXT****\n")
-    # print(context)
-    # print('')
-    prompt = f'Perform one task based on the following objective: {objective}.\n'
-    if context:
-        prompt += 'Take into account these previously completed tasks:' + '\n'.join(context)
-    prompt += f'\nYour task: {task}\nResponse:'
-    return openai_call(prompt, max_tokens=2000)
+    user_approval = input(f"Do you approve the execution of the task: '{task}'? (Y/N): ")
+    if user_approval.lower() == 'y':
+
+        context = context_agent(query=objective, top_results_num=5)
+        planet = planet_agent(query=objective, top_results_num=2)
+        # print("\n****RELEVANT CONTEXT****\n")
+        # print(context)
+        # print('')
+        prompt = f'Perform one task based on the following objective for our client Group: {objective}.\n'
+        if context:
+            prompt += 'Take into account these previously completed tasks:' + '\n'.join(context)
+        if planet:
+            prompt += 'Take into account this additional information about the Group:' + '\n'.join(planet)
+        prompt += f'\nYour task: {task}\nResponse:'
+        print(f'\n****TASK EXECUTION AGENT PROMPT****\n{prompt}\n')
+        response = openai_call(prompt, max_tokens=2000)
+        print(f'\n****TASK EXECUTION AGENT RESPONSE****\n{response}\n')
+        return response
+    else:
+        print('Operation terminated by user.')
+        return None
 
 
 # Get the top n completed tasks for the objective
@@ -534,8 +573,108 @@ def context_agent(query: str, top_results_num: int):
     results = results_storage.query(query=query, top_results_num=top_results_num)
     # print("****RESULTS****")
     # print(results)
+    print(f'\n****TASK CONTEXT AGENT PROMPT****\n{str(query)}\n')
+    print(f'\n****TASK CONTEXT AGENT RESPONSE****\n{results}\n')
     return results
 
+# Get the top n completed tasks for the objective
+def planet_agent(query: str, top_results_num: int):
+    """
+    Retrieves context for a given query from an index of tasks.
+
+    Args:
+        query (str): The query or objective for retrieving context.
+        top_results_num (int): The number of top results to retrieve.
+
+    Returns:
+        list: A list of tasks as context for the given query, sorted by relevance.
+
+    """
+    query_response = db.similarity_search(query=query, k=top_results_num)
+    # print("****RESULTS****")
+    # print(results)
+    print(f'\n****TASK PLANET AGENT PROMPT****\n{str(query)}\n')
+    print(f'\n****TASK PLANET AGENT RESPONSE****\n{query_response[0].page_content}\n')
+    return [query_response[0].page_content]
+
+
+# Helper functions for token count
+def read_token_count_from_file(model, filename='token_count.txt'):
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line_model, line_count = line.strip().split(':')
+                if line_model == model:
+                    return int(line_count)
+            return 0  # Return 0 if the model's count is not found
+    except FileNotFoundError:
+        return 0
+
+def write_token_count_to_file(model, count, filename='token_count.txt'):
+    lines = []
+    model_found = False
+    
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line_model, line_count = line.split(':')
+                
+                # If the model is found, update its count
+                if line_model == model:
+                    lines.append(f"{model}:{count}\n")
+                    model_found = True
+                else:
+                    lines.append(line)
+
+        # If the model was not previously in the file, append its count
+        if not model_found:
+            lines.append(f"{model}:{count}\n")
+
+        print(f"Writing {model} token count to file: {count}")
+
+    except FileNotFoundError:
+        lines = [f"{model}:{count}\n"]
+        
+    with open(filename, 'w') as f:
+        f.writelines(lines)
+
+# This line is needed if we need to explicitly reference the API key. Langchain can access it from .env implicitly
+#OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+#########
+
+r = requests.post(bubble_endpoint_url, data={"text": "1644944949536x293553306666008600"})
+data = r.json()
+print("response: ", str(data))
+# load the document and split it into chunks
+# Save data["response"] to a file
+with open("data.txt", "w") as outfile:
+    outfile.write(str(data["response"]))
+loader = TextLoader("data.txt")
+print("loader: ", str(loader))
+documents = loader.load()
+print("documents: ", str(documents))
+# split it into chunks
+text_splitter = CharacterTextSplitter(separator=" ", chunk_size=1000, chunk_overlap=50)
+print("text_splitter: ", str(text_splitter))
+docs = text_splitter.split_documents(documents)
+print("documents: ", str(docs))
+# create the open-source embedding function
+embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+print("embedding_function: ", str(embedding_function))
+# load it into Chroma
+db = Chroma.from_documents(docs, embedding_function)
+print("db: ", str(db))
+
+#    # query it
+#    query = "Where is the purpose of this group?"
+#    query_response = db.similarity_search(query)
+#
+#    # print results
+#    for i in range(len(query_response)):
+#        query_response_i = query_response[i].page_content
+#        print(f"answer {i}: {query_response_i}")
+#        print("\n")
 
 # Add the initial task if starting new objective
 if not JOIN_EXISTING_OBJECTIVE:
@@ -565,6 +704,10 @@ def main():
             result = execution_agent(OBJECTIVE, str(task["task_name"]))
             print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
             print(result)
+            if result == None:
+                loop = False
+                print("Agent terminated by user.")
+                return
 
             # Step 2: Enrich result and store in the results storage
             # This is where you should enrich the result if needed
